@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Make-It-3D: High-Fidelity 3D Creation from A Single Image with Diffusion Prior (ICCV 2023)
 <!-- ![Teaser](teaser.png) -->
 <div class="half">
@@ -111,3 +112,7 @@ If you find this code helpful for your research, please cite:
 
 ## Acknowledgments
 This code borrows heavily from [Stable-Dreamfusion](https://github.com/ashawkey/stable-dreamfusion). 
+=======
+# 3D-Content-Creation-Optimization
+Repository for research on optimizing 3D content creation using subject-driven guidance and textual description quality.
+>>>>>>> 02d969f4e040dfbad3b6f727ba6bad7fbdb51736
