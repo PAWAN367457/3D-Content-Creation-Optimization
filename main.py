@@ -1,4 +1,8 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="6"
+
 import torch
+# torch.cuda.set_per_process_memory_fraction(0.8)  
 import argparse
 
 from nerf.provider import NeRFDataset
@@ -11,7 +15,286 @@ import DPT.util.io
 from transformers import Blip2Processor, Blip2ForConditionalGeneration
 from PIL import Image
 
+from PIL import Image
+import clip
+import torch
+import numpy as np
+from pytorch3d.io import load_obj
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import (
+    look_at_view_transform,
+    FoVPerspectiveCameras, 
+    PointLights, 
+    DirectionalLights, 
+    Materials, 
+    RasterizationSettings, 
+    MeshRenderer, 
+    MeshRasterizer,  
+    SoftPhongShader,
+    TexturesVertex
+)
+
+
 # torch.autograd.set_detect_anomaly(True)
+
+def render_3d_mesh(obj_path, image_size=256, num_views=50):
+    """
+    Render a 3D mesh from multiple viewpoints
+    
+    Args:
+        obj_path: Path to the .obj file
+        image_size: Size of the rendered images
+        num_views: Number of viewpoints to render from
+    
+    Returns:
+        List of rendered images as numpy arrays
+    """
+    # Set the device
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    # Load the .obj file
+    verts, faces, aux = load_obj(obj_path)
+    faces_idx = faces.verts_idx.to(device)
+    verts = verts.to(device)
+    
+    # Create a Meshes object
+    # Initialize each vertex to be white in color
+    verts_rgb = torch.ones_like(verts)[None]  # (1, V, 3)
+    textures = TexturesVertex(verts_features=verts_rgb)
+    mesh = Meshes(
+        verts=[verts],
+        faces=[faces_idx],
+        textures=textures
+    )
+    
+    # Create a rasterizer
+    raster_settings = RasterizationSettings(
+        image_size=image_size, 
+        blur_radius=0.0, 
+        faces_per_pixel=1,
+    )
+    
+    # Generate camera views around the mesh
+    rendered_images = []
+    for i in range(num_views):
+        # Calculate angle for this view
+        angle = 360.0 * i / num_views
+        
+        # Create a camera
+        R, T = look_at_view_transform(dist=3.0, elev=0, azim=angle)
+        cameras = FoVPerspectiveCameras(device=device, R=R, T=T)
+        
+        # Create lights
+        lights = PointLights(device=device, location=[[0.0, 0.0, 3.0]])
+        
+        # Create a renderer
+        renderer = MeshRenderer(
+            rasterizer=MeshRasterizer(
+                cameras=cameras, 
+                raster_settings=raster_settings
+            ),
+            shader=SoftPhongShader(
+                device=device,
+                cameras=cameras,
+                lights=lights
+            )
+        )
+        
+        # Render the mesh
+        images = renderer(mesh)
+        
+        # Convert to numpy and append to list
+        rgb = images[0, ..., :3].cpu().numpy()
+        rendered_images.append(rgb)
+    
+    return rendered_images
+
+import torch
+import clip
+from PIL import Image
+import numpy as np
+
+def evaluate_clip_alignment(rendered_images, text_prompt):
+    """
+    Evaluate how well rendered images align with a text prompt using CLIP
+    
+    Args:
+        rendered_images: List of rendered images as numpy arrays
+        text_prompt: Text prompt to compare against
+    
+    Returns:
+        Average similarity score
+    """
+    # Load CLIP model
+    content = []
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    content.append("\nIndividual scores:")
+    
+    
+    # Preprocess and encode text
+    text = clip.tokenize([text_prompt]).to(device)
+    with torch.no_grad():
+        text_features = model.encode_text(text)
+        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+    
+    # Process each image and calculate similarity
+    similarities = []
+    for img in rendered_images:
+        # Convert numpy array to PIL Image
+        pil_img = Image.fromarray((img * 255).astype(np.uint8))
+        
+        # Preprocess and encode image
+        image = preprocess(pil_img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            image_features = model.encode_image(image)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        
+        # Calculate similarity
+        similarity = (100.0 * text_features @ image_features.T).item()
+        content.append(f'{ similarity} ')
+        # content.append(similarity)
+        similarities.append(similarity)
+    
+    # Return average similarity
+    content.append("\n")
+    content.append("\nAvarage scores:")
+    content.append(f'{sum(similarities) / len(similarities)}')
+    return "\n".join(content)
+import os
+from PIL import Image
+import numpy as np
+
+def export_rendered_images(rendered_images, output_dir):
+    """
+    Export rendered images as PNG files
+    
+    Args:
+        rendered_images: List of rendered images as numpy arrays
+        output_dir: Directory to save the images
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save each image
+    for i, img in enumerate(rendered_images):
+        # Convert from float [0,1] to uint8 [0,255]
+        if img.dtype == np.float32 or img.dtype == np.float64:
+            img = (img * 255).astype(np.uint8)
+        
+        # Convert to PIL Image and save
+        pil_img = Image.fromarray(img)
+        filename = os.path.join(output_dir, f"rendered_image_{i+1}.png")
+        pil_img.save(filename)
+    
+    print(f"Exported {len(rendered_images)} images to {output_dir}")
+
+import trimesh
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import os
+
+def compute_aspect_ratios(faces, vertices):
+    aspect_ratios = []
+    for face in faces:
+        v0, v1, v2 = vertices[face]
+        a = np.linalg.norm(v1 - v0)
+        b = np.linalg.norm(v2 - v1)
+        c = np.linalg.norm(v0 - v2)
+        s = (a + b + c) / 2.0
+        area = np.sqrt(max(s * (s - a) * (s - b) * (s - c), 1e-12))  # avoid sqrt of negative
+        if area == 0:
+            aspect_ratios.append(0)
+            continue
+        aspect = max(a, b, c) / (2 * area / s)  # longest edge over triangle height
+        aspect_ratios.append(aspect)
+    return np.array(aspect_ratios)
+
+def write_to_file(output_file, content):
+    with open(output_file, 'w') as file:
+        file.write(content)
+
+def analyze_mesh(obj_path):
+    mesh = trimesh.load(obj_path)
+    
+    content = []
+    content.append("\n===== Mesh Summary =====")
+    content.append(str(mesh))
+    content.append(f"Is watertight: {mesh.is_watertight}")
+    content.append(f"Euler number: {mesh.euler_number}")
+    content.append(f"Number of vertices: {len(mesh.vertices)}")
+    content.append(f"Number of faces: {len(mesh.faces)}")
+    content.append(f"Surface area: {mesh.area:.2f}")
+    content.append(f"Volume: {mesh.volume:.2f}")
+
+    content.append("\n===== Face Quality Metrics =====")
+    aspect_ratios = compute_aspect_ratios(mesh.faces, mesh.vertices)
+    content.append(f"Min aspect ratio: {aspect_ratios.min():.2f}")
+    content.append(f"Max aspect ratio: {aspect_ratios.max():.2f}")
+    content.append(f"Mean aspect ratio: {aspect_ratios.mean():.2f}")
+
+    if hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
+        content.append("\n===== UV Map Info =====")
+        uv = mesh.visual.uv
+        content.append(f"UV bounds: U({uv[:,0].min():.2f}, {uv[:,0].max():.2f}), V({uv[:,1].min():.2f}, {uv[:,1].max():.2f})")
+    else:
+        content.append("\nNo UV map found.")
+    
+    return "\n".join(content)
+
+def analyze_texture(texture_path):
+    content = ["\n===== Albedo Texture Info ====="]
+    if os.path.exists(texture_path):
+        img = Image.open(texture_path)
+        content.append(f"Image format: {img.format}")
+        content.append(f"Texture size: {img.size[0]} x {img.size[1]} (Width x Height)")
+        content.append(f"Mode: {img.mode}")
+    else:
+        content.append(f"Texture not found at {texture_path}")
+    
+    return "\n".join(content)
+
+def analyze_topology(mesh):
+    content = []
+    content.append("\n===== Mesh Topology Analysis =====")
+
+    non_manifold_edges = mesh.edges_unique[mesh.edges_unique_length != 2]
+    content.append(f"Non-manifold edges: {len(non_manifold_edges)}")
+
+    face_areas = mesh.area_faces
+    degenerate_faces = np.sum(face_areas < 1e-10)
+    content.append(f"Degenerate faces (zero/small area): {degenerate_faces}")
+
+    aspect_ratios = compute_aspect_ratios(mesh.faces, mesh.vertices)
+    thin_triangles = np.sum(aspect_ratios > 10)
+    content.append(f"Long thin triangles (aspect ratio > 10): {thin_triangles}")
+
+    if mesh.volume > 0:
+        compactness = mesh.volume ** 2 / (mesh.area ** 3)
+        content.append(f"Compactness score: {compactness:.6f}")
+    else:
+        content.append("Compactness not computable (volume <= 0)")
+
+    return "\n".join(content)
+
+def run_analysis(obj_file, texture_file):
+    mesh = trimesh.load(obj_file)
+
+    content = []
+    content.append(analyze_mesh(obj_file))
+    content.append(analyze_topology(mesh))
+    content.append(analyze_texture(texture_file))
+
+    # Determine the directory of the .obj file and create output path
+    output_directory = os.path.dirname(obj_file)
+    output_file = os.path.join(output_directory, "mesh_analysis_results.txt")
+
+    # Write all results to the output file
+    # write_to_file(output_file, "\n".join(content))
+    return "\n".join(content)
+    
+
 
 if __name__ == '__main__':
 
@@ -22,7 +305,7 @@ if __name__ == '__main__':
     parser.add_argument('--final', action='store_true', help="final train mode")
     parser.add_argument('--refine', action='store_true', help="refine mode")
     parser.add_argument('--save_mesh', action='store_true', help="export an obj mesh with texture")
-    parser.add_argument('--eval_interval', type=int, default=10, help="evaluate on the valid set every interval epochs")
+    parser.add_argument('--eval_interval', type=int, default=1, help="evaluate on the valid set every interval epochs")
     parser.add_argument('--workspace', type=str, default='workspace')
     parser.add_argument('--guidance', type=str, default='stable-diffusion', help='choose from [stable-diffusion, clip]')
     parser.add_argument('--seed', type=int, default=0)
@@ -30,6 +313,7 @@ if __name__ == '__main__':
     parser.add_argument('--guidance_scale', type=float, default=10)
     parser.add_argument('--need_back', action='store_true', help="use back text prompt")
     parser.add_argument('--suppress_face', action='store_true', help="also use negative dir text prompt.")
+
     parser.add_argument('--ref_path', default=None, type=str, help="use image as referance, only support alpha image")
 
 
@@ -44,7 +328,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_steps', type=int, default=64, help="num steps sampled per ray (only valid when not using --cuda_ray)")
     parser.add_argument('--upsample_steps', type=int, default=32, help="num steps up-sampled per ray (only valid when not using --cuda_ray)")
     parser.add_argument('--update_extra_interval', type=int, default=16, help="iter interval to update extra status (only valid when using --cuda_ray)")
-    parser.add_argument('--max_ray_batch', type=int, default=4096, help="batch size of rays at inference to avoid OOM (only valid when not using --cuda_ray)")
+    parser.add_argument('--max_ray_batch', type=int, default=2048, help="batch size of rays at inference to avoid OOM (only valid when not using --cuda_ray)")
     parser.add_argument('--albedo_iters', type=int, default=1000, help="training iters that only use albedo shading")
     parser.add_argument('--uniform_sphere_rate', type=float, default=0.5, help="likelihood of sampling camera location uniformly on the sphere surface area")
     parser.add_argument('--diff_iters', type=int, default=400, help="training iters that only use albedo shading")
@@ -159,8 +443,8 @@ if __name__ == '__main__':
     if opt.text == None:
         print("load blip2 for image caption...")
         processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
-        blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float16).to("cuda")
-        inputs = processor(image_pil, return_tensors="pt").to("cuda", torch.float16)
+        blip_model = Blip2ForConditionalGeneration.from_pretrained("Salesforce/blip2-opt-2.7b", torch_dtype=torch.float32).to("cuda")
+        inputs = processor(image_pil, return_tensors="pt").to("cuda", torch.float32)
         out = blip_model.generate(**inputs)
         caption = processor.batch_decode(out, skip_special_tokens=True)[0].strip()
         caption = caption.replace("there is ", "")
@@ -202,8 +486,8 @@ if __name__ == '__main__':
             mode="bicubic",
             align_corners=True,
         ) # [1, 1, 512, 512] [80~150]
-        DPT.util.io.write_depth_name(os.path.join(opt.workspace, opt.text.replace(" ", "_") + '_depth'), depth_prediction.squeeze().cpu().numpy(), bits=2)
-        disparity = imageio.imread(os.path.join(opt.workspace, opt.text.replace(" ", "_") + '_depth.png')) / 65535.
+        DPT.util.io.write_depth_name(os.path.join(opt.workspace, "hel"  + '_depth'), depth_prediction.squeeze().cpu().numpy(), bits=2)
+        disparity = imageio.imread(os.path.join(opt.workspace, "hel" + '_depth.png')) / 65535.
         disparity = median_filter(disparity, size=5)
         depth = 1. / np.maximum(disparity, 1e-2)
     
@@ -212,7 +496,7 @@ if __name__ == '__main__':
     # normalize estimated depth
     depth_prediction = depth_prediction * (~depth_mask) + torch.ones_like(depth_prediction) * (depth_mask)
     depth_prediction = ((depth_prediction - 1.0) / (depth_prediction.max() - 1.0)) * 0.9 + 0.1
-    # save_image(ori_imgs, os.path.join(opt.workspace, opt.text.replace(" ", "_") + '_ref.png'))
+    # save_image(ori_imgs, os.path.join(opt.workspace, opt.workspace + '_ref.png'))
 
     model = NeRFNetwork(opt)
     trainer = Trainer('df', opt, model, depth_model, guidance, 
@@ -230,7 +514,7 @@ if __name__ == '__main__':
             
     else:
         
-        train_loader = NeRFDataset(opt, device=device, type='train', H=opt.h, W=opt.w, size=100).dataloader()
+        train_loader = NeRFDataset(opt, device=device, type='train', H=opt.h, W=opt.w, size=50).dataloader()
         valid_loader = NeRFDataset(opt, device=device, type='val', H=opt.H, W=opt.W, size=5).dataloader()
         max_epoch = np.ceil(opt.iters / 100).astype(np.int32)
         trainer.train(train_loader, valid_loader, max_epoch)
@@ -248,4 +532,40 @@ if __name__ == '__main__':
             test_loader = NeRFDataset(opt, device=device, type='test', H=opt.H, W=opt.W, size=64).dataloader()
             trainer.test(mv_loader, save_path=os.path.join(opt.workspace, 'mvimg'), write_image=True, write_video=False)
             trainer.refine(os.path.join(opt.workspace, 'mvimg'), opt.refine_iters, test_loader)
+
+    obj_path = "/home/nitin/Make-It-3D/"+opt.workspace +"/mesh/mesh.obj"
+    text_prompt = os.path.join(opt.workspace, opt.text.replace(" ", "_") + '_depth')
+    
+    # Render the mesh from multiple viewpoints
+    rendered_images = render_3d_mesh(obj_path)
+    # Specify where you want to save the images
+    output_dir = "/home/nitin/Make-It-3D/results/"+opt.workspace+"/rendered_images/"
+
+    # Export the images
+    export_rendered_images(rendered_images, output_dir)
+    # Evaluate alignment with CLIP
+    content = []
+    # avg_score, individual_scores = evaluate_clip_alignment(rendered_images, text_prompt)
+
+    # text_arr = [str(x) for x in individual_scores]
+    # text = str(avg_score)
+    # content.append(text)
+    # content.append(text_arr)
+    output_directory = os.path.dirname(obj_path)
+    output_file = os.path.join(output_directory, "mesh_analysis_results.txt")
+
+    # Write all results to the output file
+    # write_to_file(output_file, "\n".join(content))
+    # print(f"Average CLIP alignment score: {avg_score:.2f}")
+    # print(f"Individual scores: {[f'{score:.2f}' for score in individual_scores]}")
+
+    obj_file = obj_path  # Replace with your actual .obj file path
+    texture_file = "/home/nitin/Make-It-3D/"+opt.workspace+"/mesh/albedo.png"  # Replace with your actual texture file path
+    content.append(run_analysis(obj_file, texture_file))
+
+
+    content.append(evaluate_clip_alignment(rendered_images, text_prompt))
+    write_to_file(output_file, "\n".join(content))
+    print(f"Analysis results saved to: {output_file}")
+    
         
